@@ -1,0 +1,83 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kamaji-addon-konnectivity.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
+{{- end }}
+{{- if .Values.rbac.create }}
+---
+# Cluster-wide read on TenantControlPlane CRs (Kamaji creates them in many
+# namespaces) + GET on the per-tenant admin-kubeconfig Secrets (used to build a
+# client and probe/heal each tenant's konnectivity tunnel). Secret access is
+# get-only: the controller never lists/watches Secrets, it reads one known
+# secret per tenant on demand via an uncached reader. Events for visibility.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}
+  labels:
+    {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kamaji.clastix.io"]
+    resources: ["tenantcontrolplanes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kamaji.clastix.io"]
+    resources: ["tenantcontrolplanes/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}
+  labels:
+    {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kamaji-addon-konnectivity.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}
+---
+# Leader election lease lives in the chart's release namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kamaji-addon-konnectivity.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kamaji-addon-konnectivity.fullname" . }}-leader-election
+{{- end }}

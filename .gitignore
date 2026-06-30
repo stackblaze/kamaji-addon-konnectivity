@@ -1,0 +1,16 @@
+# Build artifacts
+/kamaji-tcp-proxy
+/kamaji-tcp-proxy.exe
+/dist/
+/out/
+
+# Go
+/vendor/
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store

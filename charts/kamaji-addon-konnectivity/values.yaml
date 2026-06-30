@@ -1,0 +1,63 @@
+# Default values for kamaji-addon-konnectivity controller (management cluster).
+
+image:
+  repository: ghcr.io/stackblaze/kamaji-addon-konnectivity/controller
+  tag: ""        # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# - name: ghcr-pull
+
+replicaCount: 2
+
+leaderElection:
+  enabled: true
+  id: kamaji-addon-konnectivity.stackblaze.com
+
+# Tunnel verification + self-heal tuning. These map 1:1 to controller flags.
+verify:
+  # Re-verify a healthy tunnel after this interval.
+  interval: 3m
+  # Re-verify after a remediation or a transient (apiserver-unreachable) failure.
+  recheckInterval: 30s
+  # Minimum time between agent-DaemonSet bounces for the same tenant — stops a
+  # genuinely-broken cluster from being restarted in a tight loop.
+  bounceCooldown: 5m
+  # Per-call timeout for a tunnel dial probe; a wedged dial otherwise hangs ~30s.
+  probeTimeout: 10s
+  # How many rounds to probe every node (covers both round-robined apiserver replicas).
+  probeRounds: 3
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Spread replicas across nodes when possible.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: kamaji-addon-konnectivity
+
+serviceAccount:
+  create: true
+  name: ""        # defaults to the release name when empty
+
+rbac:
+  create: true
+
+# Extra controller flags (e.g. --zap-log-level=debug).
+extraArgs: []

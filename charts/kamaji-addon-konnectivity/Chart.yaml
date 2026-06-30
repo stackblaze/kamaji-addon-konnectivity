@@ -1,0 +1,24 @@
+apiVersion: v2
+name: kamaji-addon-konnectivity
+description: |
+  Konnectivity health addon for Kamaji. Installs the management-cluster
+  controller that watches TenantControlPlane CRs and, for every
+  konnectivity-enabled tenant, verifies the apiserver→in-cluster tunnel
+  actually serves dials and self-heals it (bouncing the konnectivity-agent
+  DaemonSet) when it is up-but-wedged. Pairs with kamaji-addon-ingress, which
+  handles the inbound (pod/kubectl → apiserver) direction.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kamaji
+  - hosted-control-plane
+  - konnectivity
+  - admission-webhooks
+  - self-healing
+home: https://github.com/stackblaze/kamaji-addon-konnectivity
+sources:
+  - https://github.com/stackblaze/kamaji-addon-konnectivity
+maintainers:
+  - name: Dean Kamali
+    email: dean.kamali@gmail.com
