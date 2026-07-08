@@ -23,7 +23,13 @@ import (
 // (admission webhooks time out, logs/exec hang). That per-replica coverage gap
 // is exactly what a single-VIP-in-front-of-N-servers topology produces, and it
 // can't be seen from a statistical dial probe — only by reading each server.
-const readyBackendsMetric = "konnectivity_network_proxy_server_ready_backend_connections"
+// The current gauge (labeled by proxy_strategy) and the deprecated unlabeled
+// one it replaced. We prefer the current name and fall back to the deprecated
+// one, so this works across konnectivity-server versions.
+const (
+	readyBackendsMetric     = "konnectivity_network_proxy_server_ready_backends"
+	readyBackendsMetricDepr = "konnectivity_network_proxy_server_ready_backend_connections"
+)
 
 // defaultServerMetricsPort is the konnectivity-server admin port (serves
 // /metrics). Kamaji names it `adminport` on the control-plane pod.
@@ -135,20 +141,29 @@ func (r *TenantControlPlaneReconciler) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-// parseReadyBackends returns the readyBackendsMetric value from a Prometheus
-// text exposition body (summing samples if the metric is ever emitted with
-// labels). ok=false when the metric isn't present.
+// parseReadyBackends returns the connected-agent count from a Prometheus text
+// exposition body. It prefers the current `ready_backends` gauge (summing its
+// per-proxy_strategy series) and falls back to the deprecated unlabeled
+// `ready_backend_connections`. ok=false when neither is present.
 func parseReadyBackends(body string) (float64, bool) {
+	if v, ok := sumMetric(body, readyBackendsMetric); ok {
+		return v, true
+	}
+	return sumMetric(body, readyBackendsMetricDepr)
+}
+
+// sumMetric sums every sample of `name` in a Prometheus text body. A sample
+// matches only when the char after the name starts a value (space/tab) or a
+// label set ('{'), so a longer metric sharing the prefix isn't mis-counted.
+func sumMetric(body, name string) (float64, bool) {
 	var sum float64
 	found := false
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, readyBackendsMetric) {
+		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, name) {
 			continue
 		}
-		// The char after the metric name must start a value (space/tab) or a
-		// label set ('{'), so we don't match a longer metric sharing the prefix.
-		rest := line[len(readyBackendsMetric):]
+		rest := line[len(name):]
 		if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != '{') {
 			continue
 		}

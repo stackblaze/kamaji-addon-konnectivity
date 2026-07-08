@@ -10,7 +10,18 @@ func TestParseReadyBackends(t *testing.T) {
 		ok   bool
 	}{
 		{
-			name: "present, no labels",
+			name: "current metric, labeled by proxy_strategy",
+			body: `konnectivity_network_proxy_server_ready_backends{proxy_strategy="default"} 3` + "\n",
+			want: 3, ok: true,
+		},
+		{
+			name: "current metric preferred over deprecated when both present",
+			body: `konnectivity_network_proxy_server_ready_backends{proxy_strategy="default"} 2` + "\n" +
+				"konnectivity_network_proxy_server_ready_backend_connections 2\n",
+			want: 2, ok: true,
+		},
+		{
+			name: "deprecated fallback, no labels",
 			body: "# HELP konnectivity_network_proxy_server_ready_backend_connections agents\n" +
 				"# TYPE konnectivity_network_proxy_server_ready_backend_connections gauge\n" +
 				"konnectivity_network_proxy_server_ready_backend_connections 3\n",
