@@ -22,6 +22,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -86,6 +87,13 @@ type TenantControlPlaneReconciler struct {
 	ProbeTimeout    time.Duration
 	ProbeRounds     int
 
+	// Per-server coverage check. ServerMetricsPort is the konnectivity-server
+	// admin port that serves /metrics; CoverageTimeout bounds a single scrape.
+	// HTTPClient is overridable in tests; nil uses http.DefaultClient.
+	ServerMetricsPort int
+	CoverageTimeout   time.Duration
+	HTTPClient        *http.Client
+
 	mu         sync.Mutex
 	lastBounce map[string]time.Time
 }
@@ -106,7 +114,7 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err := r.Get(ctx, req.NamespacedName, tcp); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.forget(req.NamespacedName.String())
-			tunnelHealthy.DeleteLabelValues(req.Namespace, req.Name)
+			deleteTenantMetrics(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -119,7 +127,7 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	// Only act on konnectivity-enabled tenants that haven't opted out.
 	if !konnectivityEnabled(tcp) {
-		tunnelHealthy.DeleteLabelValues(req.Namespace, req.Name)
+		deleteTenantMetrics(req.Namespace, req.Name)
 		return ctrl.Result{}, nil
 	}
 	if tcp.GetAnnotations()[AnnotationVerify] == "false" {
@@ -134,12 +142,19 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	res := r.probe(ctx, tenant)
-	switch {
-	case res.healthy:
-		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(1)
-		logger.V(1).Info("konnectivity tunnel healthy")
-		return ctrl.Result{RequeueAfter: r.SteadyInterval}, nil
 
+	// Deterministic per-server coverage: scrape each konnectivity-server's
+	// connected-agent count directly, so we catch the HA failure mode where the
+	// dial probe passes (its requests happened to land on the covered apiserver
+	// replica) while another replica's server has zero agents. Best-effort —
+	// known=false falls back to the dial probe.
+	cov := r.checkCoverage(ctx, req.Namespace, req.Name)
+	if cov.known {
+		serversTotal.WithLabelValues(req.Namespace, req.Name).Set(float64(cov.total))
+		serversCovered.WithLabelValues(req.Namespace, req.Name).Set(float64(cov.covered))
+	}
+
+	switch {
 	case !res.reachable:
 		// Couldn't reach the apiserver at all (still provisioning, or transient).
 		// Not a tunnel wedge — never bounce on this; just re-check soon.
@@ -148,24 +163,34 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.V(1).Info("tenant apiserver unreachable; will re-check")
 		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 
+	case res.healthy && !cov.incomplete():
+		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(1)
+		logger.V(1).Info("konnectivity tunnel healthy", "serversCovered", cov.covered, "serversTotal", cov.total)
+		return ctrl.Result{RequeueAfter: r.SteadyInterval}, nil
+
 	default:
-		// Reachable but wedged: agents are connected yet dials don't complete.
+		// Reachable but not fully healthy: either dials are wedged, or a
+		// control-plane replica's konnectivity-server has no agent coverage.
 		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(0)
-		return r.remediate(ctx, tcp, tenant, req.NamespacedName.String())
+		reason := "was up-but-wedged (apiserver→in-cluster dials timed out)"
+		if res.healthy && cov.incomplete() {
+			reason = fmt.Sprintf("had a control-plane replica with no agent coverage (%d/%d konnectivity-servers covered)", cov.covered, cov.total)
+		}
+		return r.remediate(ctx, tcp, tenant, req.NamespacedName.String(), reason)
 	}
 }
 
 // remediate bounces the tenant's konnectivity-agent DaemonSet, rate-limited per
 // tenant so a genuinely-broken cluster doesn't get restarted in a tight loop.
-func (r *TenantControlPlaneReconciler) remediate(ctx context.Context, tcp *unstructured.Unstructured, tenant kubernetes.Interface, key string) (ctrl.Result, error) {
+func (r *TenantControlPlaneReconciler) remediate(ctx context.Context, tcp *unstructured.Unstructured, tenant kubernetes.Interface, key, reason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if r.recentlyBounced(key) {
-		// Gave it a bounce recently and it's still wedged — let that restart
+		// Gave it a bounce recently and it's still unhealthy — let that restart
 		// settle before trying again instead of hammering.
 		r.event(tcp, corev1.EventTypeWarning, "TunnelWedged",
-			"konnectivity tunnel still not serving dials after a recent agent restart; waiting before retrying")
-		logger.Info("tunnel still wedged within cooldown; backing off")
+			"konnectivity tunnel still unhealthy after a recent agent restart; waiting before retrying")
+		logger.Info("tunnel still unhealthy within cooldown; backing off", "reason", reason)
 		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 	}
 
@@ -182,8 +207,8 @@ func (r *TenantControlPlaneReconciler) remediate(ctx context.Context, tcp *unstr
 	r.markBounced(key)
 	remediationsTotal.WithLabelValues(tcp.GetNamespace(), tcp.GetName()).Inc()
 	r.event(tcp, corev1.EventTypeWarning, "BouncedAgents",
-		"konnectivity tunnel was up-but-wedged (apiserver→in-cluster dials timed out); restarted the konnectivity-agent DaemonSet to recover it")
-	logger.Info("bounced konnectivity-agent DaemonSet to recover wedged tunnel")
+		fmt.Sprintf("konnectivity tunnel %s; restarted the konnectivity-agent DaemonSet to recover it", reason))
+	logger.Info("bounced konnectivity-agent DaemonSet to recover unhealthy tunnel", "reason", reason)
 	return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 }
 

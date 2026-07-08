@@ -30,6 +30,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
+  # List the tenant's control-plane pods to scrape each konnectivity-server's
+  # /metrics for per-server agent coverage (the HA coverage check).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

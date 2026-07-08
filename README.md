@@ -47,16 +47,28 @@ This controller makes that fix automatic and continuous.
 For each `TenantControlPlane` with `spec.addons.konnectivity` set (opt out per
 tenant with `konnectivity.stackblaze.com/verify: "false"`), on a periodic loop:
 
-1. **Verify** — build a client from the tenant's admin kubeconfig and probe
-   **every node's kubelet** through the apiserver proxy
+1. **Verify (dials)** — build a client from the tenant's admin kubeconfig and
+   probe **every node's kubelet** through the apiserver proxy
    (`/api/v1/nodes/<node>/proxy/healthz`), several rounds (so requests land on
    both round-robined apiserver replicas), with a short per-call timeout so a
    wedged dial fails fast instead of hanging ~30s. This exercises the exact
    apiserver→in-cluster path that webhooks ride.
-2. **Self-heal** — if it's reachable but not serving dials, roll-restart the
-   tenant's `konnectivity-agent` DaemonSet (rate-limited per tenant so a
-   genuinely-broken cluster isn't restarted in a loop).
-3. **Report** — emit Events on the TCP and export Prometheus metrics.
+2. **Verify (per-server coverage)** — the dial probe is statistical: with an HA
+   (multi-replica) control plane it can pass while one replica's
+   konnectivity-server has **zero** connected agents (the classic failure —
+   agents don't deterministically fan out to every server behind a single VIP).
+   So the controller also scrapes **each** konnectivity-server's admin
+   `/metrics` (`konnectivity_network_proxy_server_ready_backend_connections`)
+   and requires every Running server replica to have ≥1 agent. `covered < total`
+   is a coverage gap even when dials happen to pass. Best-effort: if servers
+   can't be scraped it falls back to the dial probe.
+3. **Self-heal** — if it's reachable but not fully healthy (dials wedged **or**
+   a server replica has no agent coverage), roll-restart the tenant's
+   `konnectivity-agent` DaemonSet (rate-limited per tenant so a genuinely-broken
+   cluster isn't restarted in a loop).
+4. **Report** — emit Events on the TCP and export Prometheus metrics, including
+   `konnectivity_servers_total` and `konnectivity_servers_covered` so a coverage
+   gap is directly alertable (`covered < total`).
 
 If the apiserver can't be reached at all (still provisioning, transient), it
 just re-checks later — it never bounces a cluster that simply isn't ready.
