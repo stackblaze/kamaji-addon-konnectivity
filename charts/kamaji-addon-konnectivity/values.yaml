@@ -27,6 +27,11 @@ verify:
   probeTimeout: 10s
   # How many rounds to probe every node (covers both round-robined apiserver replicas).
   probeRounds: 3
+  # konnectivity-server admin port that serves /metrics — scraped per control-plane
+  # replica to verify each server has agent coverage (the HA coverage check).
+  serverMetricsPort: 8133
+  # Per-server /metrics scrape timeout for the coverage check.
+  coverageTimeout: 5s
 
 resources:
   requests:

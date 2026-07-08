@@ -48,11 +48,14 @@ func main() {
 		leaderElect = flag.Bool("leader-elect", true, "enable leader election (recommended for multi-replica)")
 		leaderID    = flag.String("leader-election-id", "kamaji-addon-konnectivity.stackblaze.com", "leader election lease name")
 
-		steadyInterval = flag.Duration("verify-interval", 3*time.Minute, "re-verify a healthy tunnel after this interval")
+		steadyInterval  = flag.Duration("verify-interval", 3*time.Minute, "re-verify a healthy tunnel after this interval")
 		recheckInterval = flag.Duration("recheck-interval", 30*time.Second, "re-verify after a remediation/transient failure")
 		bounceCooldown  = flag.Duration("bounce-cooldown", 5*time.Minute, "minimum time between agent-DaemonSet bounces for the same tenant")
 		probeTimeout    = flag.Duration("probe-timeout", 10*time.Second, "per-call timeout for a tunnel dial probe (a wedged dial otherwise hangs ~30s)")
 		probeRounds     = flag.Int("probe-rounds", 3, "how many rounds to probe every node (covers both round-robined apiserver replicas)")
+
+		serverMetricsPort = flag.Int("server-metrics-port", 8133, "konnectivity-server admin port serving /metrics (per-server agent-coverage check)")
+		coverageTimeout   = flag.Duration("coverage-timeout", 5*time.Second, "per-server /metrics scrape timeout for the coverage check")
 	)
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
@@ -72,7 +75,7 @@ func main() {
 	}
 
 	if err := (&controller.TenantControlPlaneReconciler{
-		Client:          mgr.GetClient(),
+		Client: mgr.GetClient(),
 		// Uncached reader for admin-kubeconfig Secrets — avoids watching/caching
 		// every Secret in the management cluster (broad + heavy); we only ever
 		// GET one known secret per tenant on demand.
@@ -84,6 +87,9 @@ func main() {
 		BounceCooldown:  *bounceCooldown,
 		ProbeTimeout:    *probeTimeout,
 		ProbeRounds:     *probeRounds,
+
+		ServerMetricsPort: *serverMetricsPort,
+		CoverageTimeout:   *coverageTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up reconciler")
 		os.Exit(1)
