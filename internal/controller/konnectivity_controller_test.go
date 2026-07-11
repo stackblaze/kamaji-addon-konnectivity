@@ -58,3 +58,44 @@ func TestBounceCooldown(t *testing.T) {
 		t.Fatal("forget should drop the record")
 	}
 }
+
+func TestUnhealthyThresholdDebounce(t *testing.T) {
+	const key = "ns/tcp"
+
+	// Default: <1 threshold collapses to 1 (bounce on first failure).
+	r := &TenantControlPlaneReconciler{}
+	if got := r.unhealthyThreshold(); got != 1 {
+		t.Fatalf("unhealthyThreshold() with unset field = %d, want 1", got)
+	}
+
+	// With a threshold of 3, the streak must reach 3 before we'd bounce.
+	r = &TenantControlPlaneReconciler{UnhealthyThreshold: 3}
+	for i := 1; i <= 3; i++ {
+		if got := r.recordUnhealthy(key); got != i {
+			t.Fatalf("recordUnhealthy call %d returned %d, want %d", i, got, i)
+		}
+	}
+	if r.unhealthyStreak[key] < r.unhealthyThreshold() {
+		t.Fatal("streak reached threshold; should be eligible to bounce")
+	}
+
+	// A healthy verdict resets the streak — a transient blip never accumulates.
+	r.clearUnhealthy(key)
+	if _, ok := r.unhealthyStreak[key]; ok {
+		t.Fatal("clearUnhealthy should reset the streak")
+	}
+
+	// A bounce also resets the streak so a post-restart blip doesn't re-bounce.
+	r.recordUnhealthy(key)
+	r.markBounced(key)
+	if _, ok := r.unhealthyStreak[key]; ok {
+		t.Fatal("markBounced should reset the streak")
+	}
+
+	// forget drops the streak too.
+	r.recordUnhealthy(key)
+	r.forget(key)
+	if _, ok := r.unhealthyStreak[key]; ok {
+		t.Fatal("forget should drop the streak")
+	}
+}

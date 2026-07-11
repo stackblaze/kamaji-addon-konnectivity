@@ -27,6 +27,14 @@ verify:
   probeTimeout: 10s
   # How many rounds to probe every node (covers both round-robined apiserver replicas).
   probeRounds: 3
+  # Consecutive unhealthy verdicts required before bouncing the agents. The agent
+  # connection set churns (agents re-dial through a single VIP fronting N servers),
+  # so an isolated probe can catch a sub-second blip that clears on its own by the
+  # next recheck — and bouncing on that lone blip restarts the whole DaemonSet at
+  # once, a real (worse) coverage gap. Requiring the unhealth to persist across
+  # rechecks debounces churn while still healing a genuine wedge within
+  # unhealthyThreshold*recheckInterval. 1 = bounce on first failure (old behaviour).
+  unhealthyThreshold: 2
   # konnectivity-server admin port that serves /metrics — scraped per control-plane
   # replica to verify each server has agent coverage (the HA coverage check).
   serverMetricsPort: 8133
