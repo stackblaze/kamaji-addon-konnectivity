@@ -54,6 +54,8 @@ func main() {
 		probeTimeout    = flag.Duration("probe-timeout", 10*time.Second, "per-call timeout for a tunnel dial probe (a wedged dial otherwise hangs ~30s)")
 		probeRounds     = flag.Int("probe-rounds", 3, "how many rounds to probe every node (covers both round-robined apiserver replicas)")
 
+		unhealthyThreshold = flag.Int("unhealthy-threshold", 2, "consecutive unhealthy verdicts required before bouncing agents (debounces transient connection churn; 1 = bounce on first failure)")
+
 		serverMetricsPort = flag.Int("server-metrics-port", 8133, "konnectivity-server admin port serving /metrics (per-server agent-coverage check)")
 		coverageTimeout   = flag.Duration("coverage-timeout", 5*time.Second, "per-server /metrics scrape timeout for the coverage check")
 	)
@@ -87,6 +89,8 @@ func main() {
 		BounceCooldown:  *bounceCooldown,
 		ProbeTimeout:    *probeTimeout,
 		ProbeRounds:     *probeRounds,
+
+		UnhealthyThreshold: *unhealthyThreshold,
 
 		ServerMetricsPort: *serverMetricsPort,
 		CoverageTimeout:   *coverageTimeout,

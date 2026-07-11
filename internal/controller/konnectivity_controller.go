@@ -87,6 +87,18 @@ type TenantControlPlaneReconciler struct {
 	ProbeTimeout    time.Duration
 	ProbeRounds     int
 
+	// UnhealthyThreshold is how many CONSECUTIVE unhealthy verdicts a tenant
+	// must accumulate before we bounce its agents. The konnectivity-agent
+	// connection set churns (agents re-dial through a single VIP fronting N
+	// servers), so an isolated probe can catch a sub-second blip that clears on
+	// its own by the next recheck. Bouncing on that single blip restarts the
+	// whole DaemonSet at once — a real coverage gap far worse than the blip.
+	// Requiring the unhealth to PERSIST across consecutive rechecks filters
+	// transient churn while still healing a genuine wedge (which stays
+	// unhealthy) within UnhealthyThreshold*RecheckInterval. <=1 keeps the old
+	// bounce-on-first-failure behaviour.
+	UnhealthyThreshold int
+
 	// Per-server coverage check. ServerMetricsPort is the konnectivity-server
 	// admin port that serves /metrics; CoverageTimeout bounds a single scrape.
 	// HTTPClient is overridable in tests; nil uses http.DefaultClient.
@@ -96,6 +108,9 @@ type TenantControlPlaneReconciler struct {
 
 	mu         sync.Mutex
 	lastBounce map[string]time.Time
+	// unhealthyStreak counts consecutive unhealthy verdicts per tenant; reset
+	// to 0 on any healthy verdict and after a bounce.
+	unhealthyStreak map[string]int
 }
 
 // probeResult distinguishes "tunnel served dials" from "could not reach the
@@ -165,6 +180,7 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	case res.healthy && !cov.incomplete():
 		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(1)
+		r.clearUnhealthy(req.NamespacedName.String())
 		logger.V(1).Info("konnectivity tunnel healthy", "serversCovered", cov.covered, "serversTotal", cov.total)
 		return ctrl.Result{RequeueAfter: r.SteadyInterval}, nil
 
@@ -175,6 +191,20 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		reason := "was up-but-wedged (apiserver→in-cluster dials timed out)"
 		if res.healthy && cov.incomplete() {
 			reason = fmt.Sprintf("had a control-plane replica with no agent coverage (%d/%d konnectivity-servers covered)", cov.covered, cov.total)
+		}
+
+		// Debounce: the agent connection set churns (agents re-dial through a
+		// single VIP fronting N servers), so an isolated probe can catch a
+		// sub-second blip that clears by the next recheck. Bouncing on that lone
+		// blip restarts the whole DaemonSet at once — a real, worse coverage
+		// gap. Require the unhealth to PERSIST across consecutive rechecks; a
+		// genuine wedge stays unhealthy and still heals within
+		// UnhealthyThreshold*RecheckInterval.
+		streak := r.recordUnhealthy(req.NamespacedName.String())
+		if threshold := r.unhealthyThreshold(); streak < threshold {
+			logger.V(1).Info("tunnel unhealthy; awaiting confirmation before bouncing",
+				"reason", reason, "streak", streak, "threshold", threshold)
+			return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
 		}
 		return r.remediate(ctx, tcp, tenant, req.NamespacedName.String(), reason)
 	}
@@ -292,12 +322,44 @@ func (r *TenantControlPlaneReconciler) markBounced(key string) {
 		r.lastBounce = map[string]time.Time{}
 	}
 	r.lastBounce[key] = time.Now()
+	// After a bounce, re-confirm sustained unhealth before the next one so a
+	// single post-restart blip doesn't immediately re-bounce.
+	delete(r.unhealthyStreak, key)
+}
+
+// unhealthyThreshold is the number of consecutive unhealthy verdicts required
+// before bouncing. <=1 preserves the original bounce-on-first-failure behaviour.
+func (r *TenantControlPlaneReconciler) unhealthyThreshold() int {
+	if r.UnhealthyThreshold < 1 {
+		return 1
+	}
+	return r.UnhealthyThreshold
+}
+
+// recordUnhealthy increments and returns the tenant's consecutive-unhealthy count.
+func (r *TenantControlPlaneReconciler) recordUnhealthy(key string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.unhealthyStreak == nil {
+		r.unhealthyStreak = map[string]int{}
+	}
+	r.unhealthyStreak[key]++
+	return r.unhealthyStreak[key]
+}
+
+// clearUnhealthy resets the tenant's consecutive-unhealthy count (called on a
+// healthy verdict).
+func (r *TenantControlPlaneReconciler) clearUnhealthy(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.unhealthyStreak, key)
 }
 
 func (r *TenantControlPlaneReconciler) forget(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.lastBounce, key)
+	delete(r.unhealthyStreak, key)
 }
 
 // konnectivityEnabled reports whether spec.addons.konnectivity is set on the TCP.

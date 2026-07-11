@@ -51,6 +51,7 @@ spec:
             - --bounce-cooldown={{ .Values.verify.bounceCooldown }}
             - --probe-timeout={{ .Values.verify.probeTimeout }}
             - --probe-rounds={{ .Values.verify.probeRounds }}
+            - --unhealthy-threshold={{ .Values.verify.unhealthyThreshold }}
             - --server-metrics-port={{ .Values.verify.serverMetricsPort }}
             - --coverage-timeout={{ .Values.verify.coverageTimeout }}
             {{- with .Values.extraArgs }}{{ toYaml . | nindent 12 }}{{- end }}
