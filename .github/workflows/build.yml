@@ -72,3 +72,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=controller
           cache-to: type=gha,mode=max,scope=controller
+
+  # Publish the chart as an OCI artifact next to the controller image. These
+  # charts are in no helm index, so a region's mgmt build could not install
+  # them at all — kamaji-addon-konnectivity especially, whose coverage-aware
+  # settings stop a 2-replica control plane leaving an apiserver replica with
+  # zero agents and wedging webhooks on fresh zones.
+  chart:
+    needs: go-checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package and push
+        run: |
+          set -Eeuo pipefail
+          chart=charts/kamaji-addon-konnectivity
+          ver=$(awk '/^version:/ {print $2; exit}' "$chart/Chart.yaml")
+          [ -n "$ver" ] || { echo "::error::no version in $chart/Chart.yaml"; exit 1; }
+          helm package "$chart" --destination /tmp
+          helm push "/tmp/kamaji-addon-konnectivity-${ver}.tgz" oci://ghcr.io/stackblaze/charts
+          echo "pushed oci://ghcr.io/stackblaze/charts/kamaji-addon-konnectivity:${ver}" >> "$GITHUB_STEP_SUMMARY"
