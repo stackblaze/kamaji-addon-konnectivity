@@ -8,8 +8,8 @@ description: |
   DaemonSet) when it is up-but-wedged. Pairs with kamaji-addon-ingress, which
   handles the inbound (pod/kubectl → apiserver) direction.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 keywords:
   - kamaji
   - hosted-control-plane
