@@ -21,9 +21,12 @@ metadata:
   labels:
     {{- include "kamaji-addon-konnectivity.labels" . | nindent 4 }}
 rules:
+  # patch: the controller publishes the tunnel verdict as annotations on the
+  # TCP (konnectivity.stackblaze.com/tunnel-*), which k8s-healthz turns into
+  # the tenant's Checkmate alert. Metadata only — it never touches spec.
   - apiGroups: ["kamaji.clastix.io"]
     resources: ["tenantcontrolplanes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["kamaji.clastix.io"]
     resources: ["tenantcontrolplanes/status"]
     verbs: ["get"]

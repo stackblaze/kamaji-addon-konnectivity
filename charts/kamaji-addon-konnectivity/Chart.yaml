@@ -5,11 +5,13 @@ description: |
   controller that watches TenantControlPlane CRs and, for every
   konnectivity-enabled tenant, verifies the apiserver→in-cluster tunnel
   actually serves dials and self-heals it (bouncing the konnectivity-agent
-  DaemonSet) when it is up-but-wedged. Pairs with kamaji-addon-ingress, which
+  DaemonSet) when it is up-but-wedged. Also restarts individual agents that
+  stay disconnected and publishes the tunnel state on the TenantControlPlane
+  for the k8s-healthz → Checkmate alert path. Pairs with kamaji-addon-ingress, which
   handles the inbound (pod/kubectl → apiserver) direction.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.3.0
+appVersion: "0.3.0"
 keywords:
   - kamaji
   - hosted-control-plane
