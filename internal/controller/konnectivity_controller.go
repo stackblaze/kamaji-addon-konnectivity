@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -106,11 +107,37 @@ type TenantControlPlaneReconciler struct {
 	CoverageTimeout   time.Duration
 	HTTPClient        *http.Client
 
+	// Per-agent liveness (see agents.go). ManageAgents keeps a /readyz
+	// readinessProbe on the agent DaemonSet and deletes agent pods that stay
+	// NotReady (no konnectivity-server connection) for AgentRestartAfter.
+	// AgentCheckInterval is how often a HEALTHY tenant's agents are looked at
+	// between full tunnel probes (which still run every SteadyInterval).
+	ManageAgents bool
+	// AgentTenants, when non-empty, limits agent management to these
+	// "namespace/name" TCP keys (or bare TCP names) — the canary switch for a
+	// dev-zone-first rollout on a management cluster that also hosts prod
+	// zones. Empty = every tenant.
+	AgentTenants       map[string]bool
+	AgentRestartAfter  time.Duration
+	AgentCheckInterval time.Duration
+
+	// Now is the clock; nil uses time.Now. Overridable in tests.
+	Now func() time.Time
+
 	mu         sync.Mutex
 	lastBounce map[string]time.Time
+	// lastProbe remembers when (and at which TCP generation) a tenant's
+	// tunnel was last fully probed and found healthy, so the cheaper agent
+	// check can run more often than the full probe.
+	lastProbe map[string]probeMemo
 	// unhealthyStreak counts consecutive unhealthy verdicts per tenant; reset
 	// to 0 on any healthy verdict and after a bounce.
 	unhealthyStreak map[string]int
+}
+
+type probeMemo struct {
+	at         time.Time
+	generation int64
 }
 
 // probeResult distinguishes "tunnel served dials" from "could not reach the
@@ -140,20 +167,36 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	// Only act on konnectivity-enabled tenants that haven't opted out.
-	if !konnectivityEnabled(tcp) {
-		deleteTenantMetrics(req.Namespace, req.Name)
+	// Only act on konnectivity-enabled tenants that haven't opted out. Drop
+	// any tunnel state we published earlier so the alert path doesn't keep
+	// reporting a verdict nobody maintains any more.
+	if !konnectivityEnabled(tcp) || tcp.GetAnnotations()[AnnotationVerify] == "false" {
+		if !konnectivityEnabled(tcp) {
+			deleteTenantMetrics(req.Namespace, req.Name)
+		}
+		r.forget(req.NamespacedName.String())
+		if err := r.applyTunnelAnnotations(ctx, tcp, clearTunnelStatePatch(tcp.GetAnnotations())); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 	}
-	if tcp.GetAnnotations()[AnnotationVerify] == "false" {
-		return ctrl.Result{}, nil
-	}
+
+	key := req.NamespacedName.String()
+	now := r.now()
 
 	tenant, err := r.tenantClient(ctx, req.Namespace, req.Name)
 	if err != nil {
 		// CP not far enough along to have an admin kubeconfig yet — wait, don't bounce.
 		logger.V(1).Info("tenant client not ready yet", "reason", err.Error())
 		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
+	}
+
+	// Per-agent liveness: cheap (one DaemonSet GET + two LISTs), so it runs on
+	// every pass, including the ones that skip the full tunnel probe.
+	agents, restarted := r.maintainAgents(ctx, tcp, tenant, now)
+
+	if !r.probeDue(key, tcp.GetGeneration(), now, agents, restarted) {
+		return ctrl.Result{RequeueAfter: r.healthyRequeue()}, nil
 	}
 
 	res := r.probe(ctx, tenant)
@@ -169,45 +212,200 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		serversCovered.WithLabelValues(req.Namespace, req.Name).Set(float64(cov.covered))
 	}
 
-	switch {
-	case !res.reachable:
+	if !res.reachable {
 		// Couldn't reach the apiserver at all (still provisioning, or transient).
-		// Not a tunnel wedge — never bounce on this; just re-check soon.
+		// Not a tunnel wedge — never bounce on this; just re-check soon. The
+		// published tunnel state is left as it was: an unreachable apiserver
+		// is alerted on by the health bridge in its own right.
+		r.dropProbeMemo(key)
 		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(0)
 		probeErrorsTotal.WithLabelValues(req.Namespace, req.Name).Inc()
 		logger.V(1).Info("tenant apiserver unreachable; will re-check")
 		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
-
-	case res.healthy && !cov.incomplete():
-		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(1)
-		r.clearUnhealthy(req.NamespacedName.String())
-		logger.V(1).Info("konnectivity tunnel healthy", "serversCovered", cov.covered, "serversTotal", cov.total)
-		return ctrl.Result{RequeueAfter: r.SteadyInterval}, nil
-
-	default:
-		// Reachable but not fully healthy: either dials are wedged, or a
-		// control-plane replica's konnectivity-server has no agent coverage.
-		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(0)
-		reason := "was up-but-wedged (apiserver→in-cluster dials timed out)"
-		if res.healthy && cov.incomplete() {
-			reason = fmt.Sprintf("had a control-plane replica with no agent coverage (%d/%d konnectivity-servers covered)", cov.covered, cov.total)
-		}
-
-		// Debounce: the agent connection set churns (agents re-dial through a
-		// single VIP fronting N servers), so an isolated probe can catch a
-		// sub-second blip that clears by the next recheck. Bouncing on that lone
-		// blip restarts the whole DaemonSet at once — a real, worse coverage
-		// gap. Require the unhealth to PERSIST across consecutive rechecks; a
-		// genuine wedge stays unhealthy and still heals within
-		// UnhealthyThreshold*RecheckInterval.
-		streak := r.recordUnhealthy(req.NamespacedName.String())
-		if threshold := r.unhealthyThreshold(); streak < threshold {
-			logger.V(1).Info("tunnel unhealthy; awaiting confirmation before bouncing",
-				"reason", reason, "streak", streak, "threshold", threshold)
-			return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
-		}
-		return r.remediate(ctx, tcp, tenant, req.NamespacedName.String(), reason)
 	}
+
+	healthy, reason := tunnelVerdict(res, cov, agents)
+	if err := r.publishTunnelState(ctx, tcp, healthy, reason, now); err != nil {
+		// Alerting is best-effort relative to healing: log and carry on.
+		logger.Error(err, "could not publish tunnel state on the TenantControlPlane")
+	}
+
+	if healthy {
+		tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(1)
+		r.clearUnhealthy(key)
+		r.rememberProbe(key, tcp.GetGeneration(), now)
+		logger.V(1).Info("konnectivity tunnel healthy", "serversCovered", cov.covered, "serversTotal", cov.total,
+			"agentsReady", agents.ready, "agentsDesired", agents.desired)
+		return ctrl.Result{RequeueAfter: r.healthyRequeue()}, nil
+	}
+
+	// Reachable but not fully healthy: dials are wedged, a control-plane
+	// replica's konnectivity-server has no agent coverage, or no agent is
+	// connected at all.
+	r.dropProbeMemo(key)
+	tunnelHealthy.WithLabelValues(req.Namespace, req.Name).Set(0)
+
+	if len(restarted) > 0 {
+		// The per-agent restart just acted on this very failure; give the
+		// replacement agents the bounce cooldown to connect before also
+		// rolling the whole DaemonSet.
+		r.markBounced(key)
+		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
+	}
+
+	// Debounce: the agent connection set churns (agents re-dial through a
+	// single VIP fronting N servers), so an isolated probe can catch a
+	// sub-second blip that clears by the next recheck. Bouncing on that lone
+	// blip restarts the whole DaemonSet at once — a real, worse coverage
+	// gap. Require the unhealth to PERSIST across consecutive rechecks; a
+	// genuine wedge stays unhealthy and still heals within
+	// UnhealthyThreshold*RecheckInterval.
+	streak := r.recordUnhealthy(key)
+	if threshold := r.unhealthyThreshold(); streak < threshold {
+		logger.V(1).Info("tunnel unhealthy; awaiting confirmation before bouncing",
+			"reason", reason, "streak", streak, "threshold", threshold)
+		return ctrl.Result{RequeueAfter: r.RecheckInterval}, nil
+	}
+	return r.remediate(ctx, tcp, tenant, key, reason)
+}
+
+// tunnelVerdict folds the dial probe, per-server coverage and the agents'
+// own connection state into one healthy/unhealthy verdict with a reason.
+func tunnelVerdict(res probeResult, cov coverage, agents agentState) (bool, string) {
+	switch {
+	case agents.tunnelDown():
+		return false, fmt.Sprintf("had no konnectivity-agent connected to any server (0/%d agents ready)", agents.desired)
+	case !res.healthy:
+		return false, "was up-but-wedged (apiserver→in-cluster dials timed out)"
+	case cov.incomplete():
+		return false, fmt.Sprintf("had a control-plane replica with no agent coverage (%d/%d konnectivity-servers covered)", cov.covered, cov.total)
+	}
+	return true, ""
+}
+
+// publishTunnelState records the verdict on the TCP (only on a transition)
+// and in the unhealthy-duration gauge.
+func (r *TenantControlPlaneReconciler) publishTunnelState(ctx context.Context, tcp *unstructured.Unstructured, healthy bool, reason string, now time.Time) error {
+	ann := tcp.GetAnnotations()
+	patch := tunnelStatePatch(ann, healthy, reason, now)
+	err := r.applyTunnelAnnotations(ctx, tcp, patch)
+	if err == nil && patch != nil {
+		ann = tcp.GetAnnotations()
+		if !healthy {
+			r.event(tcp, corev1.EventTypeWarning, "TunnelUnhealthy", "konnectivity tunnel "+reason)
+		} else {
+			r.event(tcp, corev1.EventTypeNormal, "TunnelHealthy", "konnectivity tunnel healthy again")
+		}
+	}
+	tunnelUnhealthySeconds.WithLabelValues(tcp.GetNamespace(), tcp.GetName()).Set(unhealthySeconds(ann, now))
+	return err
+}
+
+// maintainAgents keeps the /readyz readinessProbe on the agent DaemonSet,
+// exports the per-agent gauges, and restarts agents that stayed disconnected.
+func (r *TenantControlPlaneReconciler) maintainAgents(ctx context.Context, tcp *unstructured.Unstructured, tenant kubernetes.Interface, now time.Time) (agentState, []string) {
+	if !r.managesAgentsOf(tcp.GetNamespace(), tcp.GetName()) {
+		return agentState{}, nil
+	}
+	logger := log.FromContext(ctx)
+	ns, name := tcp.GetNamespace(), tcp.GetName()
+
+	if patched, err := r.ensureAgentReadinessProbe(ctx, tenant); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "could not ensure the konnectivity-agent readinessProbe")
+		}
+	} else if patched {
+		r.event(tcp, corev1.EventTypeNormal, "AgentReadinessProbe",
+			"added a /readyz readinessProbe to the konnectivity-agent DaemonSet (agents roll once, one node at a time)")
+		logger.Info("added /readyz readinessProbe to the konnectivity-agent DaemonSet")
+	}
+
+	st := r.inspectAgents(ctx, tenant, now)
+	if !st.known {
+		return st, nil
+	}
+	agentsDesired.WithLabelValues(ns, name).Set(float64(st.desired))
+	agentsReady.WithLabelValues(ns, name).Set(float64(st.ready))
+	nodesWithoutAgent.WithLabelValues(ns, name).Set(float64(len(st.nodesWithoutAgent)))
+	agentsStuckTerminating.WithLabelValues(ns, name).Set(float64(len(st.stuckTerminating)))
+	if len(st.stuckTerminating) > 0 {
+		r.event(tcp, corev1.EventTypeWarning, "AgentStuckTerminating", fmt.Sprintf(
+			"konnectivity-agent pod(s) %v are terminating far past their grace period — the node cannot kill them (read-only root filesystem / containerd wedged?); the node needs attention",
+			st.stuckTerminating))
+	}
+
+	restarted, err := r.restartStuckAgents(ctx, tenant, st)
+	if err != nil {
+		logger.Error(err, "could not restart a disconnected konnectivity-agent")
+	}
+	if len(restarted) > 0 {
+		agentRestartsTotal.WithLabelValues(ns, name).Add(float64(len(restarted)))
+		r.event(tcp, corev1.EventTypeWarning, "RestartedAgent", fmt.Sprintf(
+			"konnectivity-agent pod(s) %v had no konnectivity-server connection (NotReady on /readyz) for over %s; deleted so the DaemonSet replaces them",
+			restarted, r.agentRestartAfter()))
+		logger.Info("restarted disconnected konnectivity-agent pods", "pods", restarted)
+	}
+	return st, restarted
+}
+
+// managesAgentsOf reports whether per-agent liveness applies to this TCP.
+func (r *TenantControlPlaneReconciler) managesAgentsOf(ns, name string) bool {
+	if !r.ManageAgents {
+		return false
+	}
+	if len(r.AgentTenants) == 0 {
+		return true
+	}
+	return r.AgentTenants[ns+"/"+name] || r.AgentTenants[name]
+}
+
+// probeDue decides whether this pass runs the full tunnel probe. It does
+// unless the tenant was found healthy less than SteadyInterval ago, at the
+// same TCP generation, and its agents look fine right now.
+func (r *TenantControlPlaneReconciler) probeDue(key string, generation int64, now time.Time, agents agentState, restarted []string) bool {
+	if len(restarted) > 0 || len(agents.notReadyTooLong) > 0 || agents.tunnelDown() ||
+		(agents.known && agents.ready < agents.desired) {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.lastProbe[key]
+	if !ok || m.generation != generation {
+		return true
+	}
+	return now.Sub(m.at) >= r.SteadyInterval
+}
+
+func (r *TenantControlPlaneReconciler) rememberProbe(key string, generation int64, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastProbe == nil {
+		r.lastProbe = map[string]probeMemo{}
+	}
+	r.lastProbe[key] = probeMemo{at: now, generation: generation}
+}
+
+func (r *TenantControlPlaneReconciler) dropProbeMemo(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.lastProbe, key)
+}
+
+// healthyRequeue is the requeue after a healthy pass: the agent-check cadence
+// when per-agent liveness is on (the full probe still only runs every
+// SteadyInterval — see probeDue), else SteadyInterval.
+func (r *TenantControlPlaneReconciler) healthyRequeue() time.Duration {
+	if r.ManageAgents && r.AgentCheckInterval > 0 && r.AgentCheckInterval < r.SteadyInterval {
+		return r.AgentCheckInterval
+	}
+	return r.SteadyInterval
+}
+
+func (r *TenantControlPlaneReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // remediate bounces the tenant's konnectivity-agent DaemonSet, rate-limited per
@@ -360,6 +558,7 @@ func (r *TenantControlPlaneReconciler) forget(key string) {
 	defer r.mu.Unlock()
 	delete(r.lastBounce, key)
 	delete(r.unhealthyStreak, key)
+	delete(r.lastProbe, key)
 }
 
 // konnectivityEnabled reports whether spec.addons.konnectivity is set on the TCP.
@@ -383,6 +582,6 @@ func (r *TenantControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	tcpObj.SetGroupVersionKind(tcpGVK)
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("tenantcontrolplane-konnectivity").
-		For(tcpObj).
+		For(tcpObj, builder.WithPredicates(tcpEventFilter())).
 		Complete(r)
 }

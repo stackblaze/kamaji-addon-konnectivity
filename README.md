@@ -70,6 +70,30 @@ tenant with `konnectivity.stackblaze.com/verify: "false"`), on a periodic loop:
    `konnectivity_servers_total` and `konnectivity_servers_covered` so a coverage
    gap is directly alertable (`covered < total`).
 
+5. **Per-agent liveness** — Kamaji's livenessProbe on the agent hits
+   `/healthz`, which the agent answers `ok` for as long as the process runs, so a
+   disconnected agent — or one that got SIGTERM and sits in "draining" forever
+   (`Skipping connectOnce - agent is draining`) — is never restarted. The
+   agent's `/readyz` runs the `server-connected` check and fails with
+   `no servers connected` when it has zero READY server connections
+   (apiserver-network-proxy `pkg/agent/readiness.go`, v0.30–v0.35). Kamaji
+   re-asserts the livenessProbe on every reconcile but never touches the
+   readinessProbe, so the controller keeps a `/readyz` readinessProbe on the
+   DaemonSet and deletes any agent pod that has been NotReady for
+   `--agent-restart-after` (90s) — one at a time while other agents are
+   connected, all at once when none is. Agents stuck terminating (the node
+   can't kill them) are reported, not touched.
+6. **Publish the tunnel state for alerting** — on every healthy↔unhealthy
+   transition the controller annotates the TCP:
+   `konnectivity.stackblaze.com/tunnel-state` (`healthy`|`unhealthy`),
+   `…/tunnel-unhealthy-since` (RFC3339) and `…/tunnel-reason`.
+   [k8s-healthz](https://github.com/stackblaze/k8s-healthz) (the Kamaji →
+   Checkmate bridge) already lists every TCP and turns "unhealthy for more than
+   2 minutes" into a 503 on `/tenant/<name>`, i.e. the tenant's existing
+   Checkmate monitor goes down and notifies. The controller's own watch ignores
+   updates that only touch these keys (or status), so a write never re-triggers
+   a probe.
+
 If the apiserver can't be reached at all (still provisioning, transient), it
 just re-checks later — it never bounces a cluster that simply isn't ready.
 
@@ -116,6 +140,11 @@ metadata:
 | `verify.bounceCooldown` | `--bounce-cooldown` | `5m` | Min time between agent bounces per tenant. |
 | `verify.probeTimeout` | `--probe-timeout` | `10s` | Per-dial probe timeout (wedged dial otherwise hangs ~30s). |
 | `verify.probeRounds` | `--probe-rounds` | `3` | Probe rounds per node (covers both apiserver replicas). |
+| `verify.unhealthyThreshold` | `--unhealthy-threshold` | `2` | Consecutive unhealthy verdicts before a DaemonSet bounce. |
+| `agents.manage` | `--manage-agents` | `true` | Keep the `/readyz` readinessProbe on the agent DaemonSet + restart disconnected agents. |
+| `agents.onlyTenants` | `--manage-agents-tenants` | `[]` | Canary: limit agent management to these TCPs (empty = all). |
+| `agents.restartAfter` | `--agent-restart-after` | `90s` | NotReady (disconnected) this long → agent pod deleted. |
+| `agents.checkInterval` | `--agent-check-interval` | `30s` | Agent check cadence for a healthy tenant between full probes. |
 | `replicaCount` | — | `2` | HA via leader election. |
 
 ### Metrics
@@ -127,8 +156,15 @@ Exposed on `:8080/metrics`:
 | `konnectivity_tunnel_healthy` | gauge | `namespace`, `tcp` | 1 if the last probe served dials on every node, else 0. |
 | `konnectivity_remediations_total` | counter | `namespace`, `tcp` | Agent-DaemonSet bounces issued. |
 | `konnectivity_probe_errors_total` | counter | `namespace`, `tcp` | Probes that couldn't reach the apiserver at all (not a wedge). |
+| `konnectivity_servers_total` / `_covered` | gauge | `namespace`, `tcp` | Server replicas vs. replicas with ≥1 agent. |
+| `konnectivity_tunnel_unhealthy_seconds` | gauge | `namespace`, `tcp` | Length of the current unhealthy episode (0 when healthy). |
+| `konnectivity_agents_desired` / `_ready` | gauge | `namespace`, `tcp` | Agent DaemonSet desired vs. pods connected to ≥1 server. |
+| `konnectivity_nodes_without_agent` | gauge | `namespace`, `tcp` | Ready nodes with no running agent (untolerated taint?). |
+| `konnectivity_agents_stuck_terminating` | gauge | `namespace`, `tcp` | Agent pods the node cannot kill. |
+| `konnectivity_agent_restarts_total` | counter | `namespace`, `tcp` | Disconnected agents the controller restarted. |
 
-Alert on `konnectivity_tunnel_healthy == 0` for more than a few minutes, or on a
+The human-facing alert rides k8s-healthz → Checkmate (see 6. above). If you
+also scrape these, alert on `konnectivity_tunnel_unhealthy_seconds > 120`, or on a
 rising `konnectivity_remediations_total` (a tenant that keeps needing bounces is
 a deeper problem — e.g. CP-replica/agent distribution — worth investigating).
 

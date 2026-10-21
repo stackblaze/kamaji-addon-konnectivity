@@ -41,6 +41,34 @@ verify:
   # Per-server /metrics scrape timeout for the coverage check.
   coverageTimeout: 5s
 
+# Per-agent liveness for each tenant's konnectivity-agent DaemonSet.
+#
+# Kamaji's own livenessProbe hits the agent's /healthz, which answers "ok" for as
+# long as the process runs — a disconnected or draining agent is never restarted.
+# The agent's /readyz is the endpoint that fails when it has no konnectivity-server
+# connection. Kamaji re-asserts the livenessProbe on every reconcile (so it can't
+# be pointed at /readyz) but leaves readinessProbe alone, so the controller:
+#   - keeps a /readyz readinessProbe on the DaemonSet (one-time roll when added,
+#     one node at a time), and
+#   - deletes any agent pod that has been NotReady for `restartAfter` (and up at
+#     least that long), so the DaemonSet replaces it. One pod per recheck while
+#     other agents are connected; all at once when none is.
+agents:
+  manage: true
+  # Canary: limit agent management to these TCP names (or namespace/name).
+  # A region's mgmt cluster hosts dev AND prod zones (us-west-1:
+  # shared-dev-west-1-a + shared-west-1-a), so roll out with
+  # [shared-dev-west-1-a] first, then empty it. Empty = every tenant.
+  onlyTenants: []
+  # NotReady → restart. Readiness flips ~30s after the last connection drops
+  # (period 10s x 3), so a dead agent is replaced ~2 min after it disconnects —
+  # longer than the dial-probe debounce (unhealthyThreshold x recheckInterval),
+  # so a control-plane roll is ridden out by the DaemonSet-level logic first.
+  restartAfter: 90s
+  # How often a HEALTHY tenant's agents are checked between full tunnel probes
+  # (the full probe still runs every verify.interval).
+  checkInterval: 30s
+
 resources:
   requests:
     cpu: 50m

@@ -40,10 +40,45 @@ var (
 		Name: "konnectivity_servers_covered",
 		Help: "How many of the tenant's konnectivity-server replicas have >=1 connected agent (tunnel coverage).",
 	}, []string{"namespace", "tcp"})
+
+	// tunnelUnhealthySeconds is how long the current unhealthy episode has
+	// lasted (0 when healthy) — the same clock k8s-healthz alerts on via the
+	// TCP's tunnel-unhealthy-since annotation. Alert: > 120.
+	tunnelUnhealthySeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "konnectivity_tunnel_unhealthy_seconds",
+		Help: "Seconds the tenant konnectivity tunnel has been continuously unhealthy (0 when healthy).",
+	}, []string{"namespace", "tcp"})
+
+	// Per-agent view of the tenant's konnectivity-agent DaemonSet.
+	agentsDesired = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "konnectivity_agents_desired",
+		Help: "konnectivity-agent DaemonSet desiredNumberScheduled in the tenant.",
+	}, []string{"namespace", "tcp"})
+
+	agentsReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "konnectivity_agents_ready",
+		Help: "konnectivity-agent pods Ready (connected to >=1 konnectivity-server once the /readyz readinessProbe is in place).",
+	}, []string{"namespace", "tcp"})
+
+	nodesWithoutAgent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "konnectivity_nodes_without_agent",
+		Help: "Ready tenant nodes with no running konnectivity-agent pod (taint not tolerated, or agent missing).",
+	}, []string{"namespace", "tcp"})
+
+	agentsStuckTerminating = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "konnectivity_agents_stuck_terminating",
+		Help: "konnectivity-agent pods terminating well past their grace period (the kubelet/containerd cannot kill them).",
+	}, []string{"namespace", "tcp"})
+
+	agentRestartsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "konnectivity_agent_restarts_total",
+		Help: "konnectivity-agent pods deleted by the controller because they stayed disconnected (NotReady on /readyz).",
+	}, []string{"namespace", "tcp"})
 )
 
 func init() {
-	metrics.Registry.MustRegister(tunnelHealthy, remediationsTotal, probeErrorsTotal, serversTotal, serversCovered)
+	metrics.Registry.MustRegister(tunnelHealthy, remediationsTotal, probeErrorsTotal, serversTotal, serversCovered,
+		tunnelUnhealthySeconds, agentsDesired, agentsReady, nodesWithoutAgent, agentsStuckTerminating, agentRestartsTotal)
 }
 
 // deleteTenantMetrics drops a tenant's gauge series when its TCP is gone or
@@ -53,4 +88,9 @@ func deleteTenantMetrics(namespace, tcp string) {
 	tunnelHealthy.DeleteLabelValues(namespace, tcp)
 	serversTotal.DeleteLabelValues(namespace, tcp)
 	serversCovered.DeleteLabelValues(namespace, tcp)
+	tunnelUnhealthySeconds.DeleteLabelValues(namespace, tcp)
+	agentsDesired.DeleteLabelValues(namespace, tcp)
+	agentsReady.DeleteLabelValues(namespace, tcp)
+	nodesWithoutAgent.DeleteLabelValues(namespace, tcp)
+	agentsStuckTerminating.DeleteLabelValues(namespace, tcp)
 }
