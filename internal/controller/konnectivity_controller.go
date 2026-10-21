@@ -112,7 +112,12 @@ type TenantControlPlaneReconciler struct {
 	// NotReady (no konnectivity-server connection) for AgentRestartAfter.
 	// AgentCheckInterval is how often a HEALTHY tenant's agents are looked at
 	// between full tunnel probes (which still run every SteadyInterval).
-	ManageAgents       bool
+	ManageAgents bool
+	// AgentTenants, when non-empty, limits agent management to these
+	// "namespace/name" TCP keys (or bare TCP names) — the canary switch for a
+	// dev-zone-first rollout on a management cluster that also hosts prod
+	// zones. Empty = every tenant.
+	AgentTenants       map[string]bool
 	AgentRestartAfter  time.Duration
 	AgentCheckInterval time.Duration
 
@@ -299,7 +304,7 @@ func (r *TenantControlPlaneReconciler) publishTunnelState(ctx context.Context, t
 // maintainAgents keeps the /readyz readinessProbe on the agent DaemonSet,
 // exports the per-agent gauges, and restarts agents that stayed disconnected.
 func (r *TenantControlPlaneReconciler) maintainAgents(ctx context.Context, tcp *unstructured.Unstructured, tenant kubernetes.Interface, now time.Time) (agentState, []string) {
-	if !r.ManageAgents {
+	if !r.managesAgentsOf(tcp.GetNamespace(), tcp.GetName()) {
 		return agentState{}, nil
 	}
 	logger := log.FromContext(ctx)
@@ -341,6 +346,17 @@ func (r *TenantControlPlaneReconciler) maintainAgents(ctx context.Context, tcp *
 		logger.Info("restarted disconnected konnectivity-agent pods", "pods", restarted)
 	}
 	return st, restarted
+}
+
+// managesAgentsOf reports whether per-agent liveness applies to this TCP.
+func (r *TenantControlPlaneReconciler) managesAgentsOf(ns, name string) bool {
+	if !r.ManageAgents {
+		return false
+	}
+	if len(r.AgentTenants) == 0 {
+		return true
+	}
+	return r.AgentTenants[ns+"/"+name] || r.AgentTenants[name]
 }
 
 // probeDue decides whether this pass runs the full tunnel probe. It does

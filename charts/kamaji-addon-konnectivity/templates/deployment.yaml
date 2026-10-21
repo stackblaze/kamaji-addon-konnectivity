@@ -55,6 +55,9 @@ spec:
             - --server-metrics-port={{ .Values.verify.serverMetricsPort }}
             - --coverage-timeout={{ .Values.verify.coverageTimeout }}
             - --manage-agents={{ .Values.agents.manage }}
+            {{- with .Values.agents.onlyTenants }}
+            - --manage-agents-tenants={{ join "," . }}
+            {{- end }}
             - --agent-restart-after={{ .Values.agents.restartAfter }}
             - --agent-check-interval={{ .Values.agents.checkInterval }}
             {{- with .Values.extraArgs }}{{ toYaml . | nindent 12 }}{{- end }}

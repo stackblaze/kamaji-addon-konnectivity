@@ -20,6 +20,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -63,6 +64,7 @@ func main() {
 		coverageTimeout   = flag.Duration("coverage-timeout", 5*time.Second, "per-server /metrics scrape timeout for the coverage check")
 
 		manageAgents       = flag.Bool("manage-agents", true, "keep a /readyz readinessProbe on each tenant's konnectivity-agent DaemonSet and restart agent pods that stay disconnected")
+		agentTenants       = flag.String("manage-agents-tenants", "", "comma-separated TCP names (or namespace/name) to limit agent management to — canary rollout; empty = all tenants")
 		agentRestartAfter  = flag.Duration("agent-restart-after", 90*time.Second, "delete an agent pod that has been NotReady (no konnectivity-server connection) for this long")
 		agentCheckInterval = flag.Duration("agent-check-interval", 30*time.Second, "how often a healthy tenant's agents are checked between full tunnel probes")
 	)
@@ -103,6 +105,7 @@ func main() {
 		CoverageTimeout:   *coverageTimeout,
 
 		ManageAgents:       *manageAgents,
+		AgentTenants:       csvSet(*agentTenants),
 		AgentRestartAfter:  *agentRestartAfter,
 		AgentCheckInterval: *agentCheckInterval,
 	}).SetupWithManager(mgr); err != nil {
@@ -124,4 +127,18 @@ func main() {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+// csvSet turns "a,b, c" into a set; empty input yields nil.
+func csvSet(s string) map[string]bool {
+	var out map[string]bool
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[v] = true
+		}
+	}
+	return out
 }

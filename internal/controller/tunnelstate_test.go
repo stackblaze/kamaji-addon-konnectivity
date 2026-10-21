@@ -196,3 +196,21 @@ func TestPublishTunnelStateWritesAnnotations(t *testing.T) {
 		t.Fatalf("annotations after recovery: %v", a)
 	}
 }
+
+func TestManagesAgentsOf(t *testing.T) {
+	r := &TenantControlPlaneReconciler{}
+	if r.managesAgentsOf("a", "a") {
+		t.Fatal("feature off → never")
+	}
+	r.ManageAgents = true
+	if !r.managesAgentsOf("a", "a") {
+		t.Fatal("no allowlist → every tenant")
+	}
+	r.AgentTenants = map[string]bool{"shared-dev-west-1-a": true, "ns/other": true}
+	if !r.managesAgentsOf("shared-dev-west-1-a", "shared-dev-west-1-a") || !r.managesAgentsOf("ns", "other") {
+		t.Fatal("allowlisted tenants must be managed")
+	}
+	if r.managesAgentsOf("shared-west-1-a", "shared-west-1-a") {
+		t.Fatal("tenants outside the allowlist must be left alone")
+	}
+}

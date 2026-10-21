@@ -142,6 +142,7 @@ metadata:
 | `verify.probeRounds` | `--probe-rounds` | `3` | Probe rounds per node (covers both apiserver replicas). |
 | `verify.unhealthyThreshold` | `--unhealthy-threshold` | `2` | Consecutive unhealthy verdicts before a DaemonSet bounce. |
 | `agents.manage` | `--manage-agents` | `true` | Keep the `/readyz` readinessProbe on the agent DaemonSet + restart disconnected agents. |
+| `agents.onlyTenants` | `--manage-agents-tenants` | `[]` | Canary: limit agent management to these TCPs (empty = all). |
 | `agents.restartAfter` | `--agent-restart-after` | `90s` | NotReady (disconnected) this long → agent pod deleted. |
 | `agents.checkInterval` | `--agent-check-interval` | `30s` | Agent check cadence for a healthy tenant between full probes. |
 | `replicaCount` | — | `2` | HA via leader election. |

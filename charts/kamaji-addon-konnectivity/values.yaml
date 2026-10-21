@@ -55,6 +55,11 @@ verify:
 #     other agents are connected; all at once when none is.
 agents:
   manage: true
+  # Canary: limit agent management to these TCP names (or namespace/name).
+  # A region's mgmt cluster hosts dev AND prod zones (us-west-1:
+  # shared-dev-west-1-a + shared-west-1-a), so roll out with
+  # [shared-dev-west-1-a] first, then empty it. Empty = every tenant.
+  onlyTenants: []
   # NotReady → restart. Readiness flips ~30s after the last connection drops
   # (period 10s x 3), so a dead agent is replaced ~2 min after it disconnects —
   # longer than the dial-probe debounce (unhealthyThreshold x recheckInterval),
